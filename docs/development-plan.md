@@ -1,6 +1,6 @@
-# 财富风险诊断访谈系统 — 开发计划 v2.0
+# 财富风险诊断访谈系统 — 开发计划 v2.1
 
-> 基于架构设计文档 v1.0 | 制定日期：2026-03-02
+> 基于架构设计文档 v1.0 | 制定日期：2026-03-02 | v2.1 更新：2026-03-02（新增会话续接 + 变化诊断）
 
 ---
 
@@ -13,19 +13,21 @@
 ```
 阶段划分：
 
-  Phase 0  项目骨架 & 基础设施（1-2天）
-  Phase 1  语音管道：LiveKit + VAD + ASR（2-3天）
-  Phase 2  TTS 预生成 & 题库数据层（2天）
-  Phase 3  访谈引擎核心：状态机 + LLM 判断（3-4天）
-  Phase 4  提取循环 & 分层触发（2-3天）
-  Phase 5  诊断引擎 & 报告生成（2-3天）
-  Phase 6  前端（HTML/JS + LiveKit Client）（2天）
-  Phase 7  持久化：PostgreSQL + Redis（1-2天）
-  Phase 8  异常处理 & 健壮性（1-2天）
-  Phase 9  集成测试 & 延迟调优（2天）
-  Phase 10 部署 & 上线（1-2天）
+  Phase 0   项目骨架 & 基础设施（1-2天）
+  Phase 1   语音管道：LiveKit + VAD + ASR（2-3天）
+  Phase 2   TTS 预生成 & 题库数据层（2天）
+  Phase 3   访谈引擎核心：状态机 + LLM 判断（3-4天）
+  Phase 3.5 会话续接：顾问专属链接 + 断点恢复 ★新增（2天）
+  Phase 4   提取循环 & 分层触发（2-3天）
+  Phase 5   诊断引擎 & 报告生成（2-3天）
+  Phase 5.5 变化诊断：多次诊断 Delta 对比 + 报告内嵌 ★新增（2天）
+  Phase 6   前端（HTML/JS + LiveKit Client）（2天）
+  Phase 7   持久化：PostgreSQL + Redis（1-2天）
+  Phase 8   异常处理 & 健壮性（1-2天）
+  Phase 9   集成测试 & 延迟调优（2天）
+  Phase 10  部署 & 上线（1-2天）
 
-  总计：~20-25 个工作日
+  总计：~25-30 个工作日
 ```
 
 ---
@@ -576,6 +578,115 @@ async def run_interview(session_id: str, room: rtc.Room):
 
 ---
 
+## Phase 3.5 — 会话续接 ★新增
+
+### 目标
+访谈中断后，客户通过顾问发送的专属链接重新进入，系统自动从断点继续，无需重头开始。
+
+### 业务决策
+- **身份方案**：顾问后台为每位客户生成一条专属链接（`/c/{client_token}`），无需客户注册登录
+- **链接可复用**：同一链接可多次点击，每次自动判断是续接还是新建
+
+### 3.5.1 数据模型新增
+
+```python
+# app/models/client.py（新增文件）
+from pydantic import BaseModel
+from datetime import datetime
+
+class Client(BaseModel):
+    """顾问创建的客户档案，跨 session 持久标识"""
+    client_id: str           # UUID
+    client_token: str        # URL 中的 token，32位随机串
+    advisor_id: str | None   # 顾问标识（可选）
+    name: str | None = None
+    phone: str | None = None
+    created_at: datetime
+```
+
+`InterviewState`（`app/models/interview.py`）新增字段：
+```python
+client_id: str                        # 关联 clients 表
+resume_count: int = 0                 # 续接次数
+last_system_question_id: str | None = None  # 最后播放的题目（续接时重播）
+last_save_at: datetime | None = None  # 最后持久化时间
+```
+
+### 3.5.2 SessionManager
+
+```python
+# app/engine/session_manager.py（新增文件）
+class SessionManager:
+
+    async def get_or_create_session(self, client_token: str) -> dict:
+        """
+        专属链接的入口逻辑：
+        1. 通过 client_token 查 clients 表 → 得到 client_id
+        2. 查该 client_id 最近一个 status != 'done' 的 session
+           ├── 有 → 调用 resume_session()，返回 is_resumed=True
+           └── 无 → 调用 create_session()，返回 is_resumed=False
+        """
+
+    async def create_session(self, client_id: str) -> InterviewState:
+        """新建会话，写 PostgreSQL + Redis（TTL 按阶段动态设置）"""
+
+    async def resume_session(self, session_id: str) -> InterviewState:
+        """
+        续接流程：
+        1. 先读 Redis（热）；Redis 过期则降级读 PostgreSQL（冷）
+        2. state.resume_count += 1
+        3. 重建 LiveKit 房间（旧房间已销毁）
+        4. 播放续接问候语 resume_greeting.wav
+        5. 重播 state.last_system_question_id 对应的预生成音频
+        """
+
+    def _calculate_ttl(self, status: InterviewStatus) -> int:
+        """
+        动态 TTL（替代原固定 1h）：
+          GREETING    → 6h
+          INTERVIEWING → 24h（访谈中途，可能隔天继续）
+          DIAGNOSING  → 24h
+          DONE        → 72h（报告可查）
+        """
+        ttl_map = {
+            InterviewStatus.GREETING:    6 * 3600,
+            InterviewStatus.INTERVIEWING: 24 * 3600,
+            InterviewStatus.DIAGNOSING:  24 * 3600,
+            InterviewStatus.DONE:        72 * 3600,
+        }
+        return ttl_map.get(status, 3600)
+```
+
+### 3.5.3 新增 API 端点
+
+```
+GET /c/{client_token}
+  逻辑：验证 token → get_or_create_session() → 返回 LiveKit 连接凭证
+  出参：{session_id, is_resumed, resume_from_unit, livekit_url, livekit_token}
+
+POST /advisor/clients
+  逻辑：顾问后台调用，生成新客户档案 + client_token
+  出参：{client_id, client_token, shareable_url}
+```
+
+### 3.5.4 续接语音处理
+
+在 `data/audio_cache/` 中预生成（Phase 2 的 TTS 脚本扩展）：
+- `resume_greeting.wav`：「欢迎回来，我们上次聊到了 {unit_name}，我再问您一遍……」
+- 续接后直接重播 `state.last_system_question_id` 对应的预生成音频
+
+Redis 过期（状态丢失）时降级处理：
+- 从 PostgreSQL 恢复 `state_json`（保证不丢状态）
+- 提示语改为：「欢迎回来，我们从上次进行到的地方继续……」
+
+### 验收标准
+- [ ] 访谈进行到单元 10 时强制关闭浏览器，重新点击专属链接，从单元 10 继续
+- [ ] 续接后系统播放问候语并重播最后一道题
+- [ ] Redis 过期（模拟删除 key）后，从 PostgreSQL 正常恢复并继续
+- [ ] 顾问调用 `POST /advisor/clients` 生成链接，客户点击可正常进入
+
+---
+
 ## Phase 4 — 提取循环 & 分层触发
 
 ### 目标
@@ -838,6 +949,147 @@ async def generate_report(state: InterviewState,
 
 ---
 
+## Phase 5.5 — 变化诊断 ★新增
+
+### 目标
+同一客户完成第二次（及以后）诊断时，PDF 报告中自动包含"与上次对比"章节，展示维度级 Delta、改善/恶化单元、趋势评级。首次诊断该章节自动隐藏。
+
+### 业务决策
+- **触发方式**：自动，诊断完成时 `report.py` 内部触发，无需用户/顾问手动操作
+- **报告内嵌**：对比数据直接写入 PDF，第一次诊断时该章节不出现
+
+### 5.5.1 数据模型新增
+
+```python
+# app/models/diagnosis.py（新增文件）
+from pydantic import BaseModel, Literal
+from datetime import datetime
+
+class DiagnosisReport(BaseModel):
+    """诊断报告元数据（结构化存储，支持历史查询和对比）"""
+    report_id: str
+    client_id: str           # 关联 clients 表
+    session_id: str
+    created_at: datetime
+    unit_scores: dict[str, float]       # {unit_id: 0-100}
+    dimension_scores: dict[str, float]  # {维度名: 0-100}
+    overall_risk_level: str             # "低风险"|"中风险"|"中高风险"|"高风险"
+    top_risks: list[dict]
+    recommendations: list[str]
+    emotion_summary: dict[str, int]
+
+class DiagnosisComparison(BaseModel):
+    """两份报告的 Delta 对比结果"""
+    comparison_id: str
+    client_id: str
+    baseline_report_id: str    # 上一次诊断
+    current_report_id: str     # 本次诊断
+    created_at: datetime
+    overall_risk_change: Literal["改善", "恶化", "无变化"]
+    dimension_deltas: dict[str, float]  # {维度: 分数变化量，正=改善，负=恶化}
+    unit_improvements: list[dict]       # delta > +5 的单元
+    unit_regressions: list[dict]        # delta < -5 的单元
+    trend_summary: Literal["积极趋势", "需关注", "警示"]
+    insights: list[str]                 # 自动生成的文字洞察（3-5条）
+```
+
+### 5.5.2 对比计算引擎
+
+```python
+# app/diagnosis/comparison.py（新增文件）
+class DiagnosisComparisonEngine:
+
+    async def compare_reports(
+        self,
+        baseline: DiagnosisReport,
+        current: DiagnosisReport,
+    ) -> DiagnosisComparison:
+        """
+        1. 计算 dimension_deltas：各维度分数差值
+        2. 枚举所有单元：delta > +5 → improvements；delta < -5 → regressions
+        3. 整体风险等级：比较 overall_risk_level 的级别 index
+        4. 趋势评级：
+           - avg(dimension_deltas) > +10 或 improvements > regressions*2 → "积极趋势"
+           - regressions > improvements*2 → "警示"
+           - 其他 → "需关注"
+        5. 自动生成 insights（整体变化 + 最显著改善/恶化维度 + 建议关注点）
+        """
+```
+
+### 5.5.3 报告生成集成
+
+`app/diagnosis/report.py` 的 `generate_report()` 扩展：
+
+```python
+async def generate_report(
+    state: InterviewState,
+    risk_report: RiskReport,
+    client_id: str,
+) -> bytes:
+    # 1. 将当前诊断结果存入 diagnosis_reports 表
+    current = await db.save_diagnosis_report(client_id, session_id, risk_report)
+
+    # 2. 查询同一客户的上一份报告
+    previous = await db.get_previous_report(client_id, current.created_at)
+
+    # 3. 若有上一份报告，计算 Delta
+    comparison = None
+    if previous:
+        comparison = await comparison_engine.compare_reports(previous, current)
+        await db.save_comparison(comparison)
+
+    # 4. 渲染 Jinja2 模板（has_comparison 控制章节显示）
+    html = template.render(
+        ...,
+        has_comparison=comparison is not None,
+        comparison=comparison,
+        previous_report=previous,
+    )
+    return weasyprint.HTML(string=html).write_pdf()
+```
+
+### 5.5.4 报告模板扩展
+
+`templates/report.html` 新增章节（`{% if has_comparison %}` 包裹）：
+
+```
+┌─────────────────────────────────────────────┐
+│  与上次诊断对比（{previous_date} → 本次）        │
+├─────────────────────────────────────────────┤
+│  整体风险变化：中风险 → 中风险（无变化）           │
+│  趋势评级：需关注                               │
+├─────────────┬────────────┬──────────────────┤
+│  维度        │ 上次分数   │ 本次分数  变化    │
+│  收入稳定性   │   72      │   80    ↑ +8     │
+│  资产负债     │   65      │   58    ↓ -7     │
+│  ...         │           │                  │
+├─────────────────────────────────────────────┤
+│  显著改善（3项）  ▲ 收入稳定性 +8 ...           │
+│  需关注（2项）    ▼ 资产负债 -7 ...             │
+├─────────────────────────────────────────────┤
+│  [双雷达图：当前（实线）vs 上次（虚线）]           │
+└─────────────────────────────────────────────┘
+```
+
+### 5.5.5 新增 API 端点
+
+```
+GET /client/{client_id}/reports
+  出参：该客户所有诊断报告列表（时间倒序，含 overall_risk_level 和 dimension_scores）
+
+GET /report/{report_id}/pdf
+  出参：PDF 文件下载（包含对比章节，如有历史）
+```
+
+### 验收标准
+- [ ] 同一客户完成第 2 次诊断，PDF 中出现"与上次对比"章节
+- [ ] 双雷达图正确渲染（当前实线 + 上次虚线叠加）
+- [ ] 维度变化表格数值准确（手动核对 dimension_scores Delta）
+- [ ] 第 1 次诊断的 PDF 中"与上次对比"章节不出现
+- [ ] `GET /client/{id}/reports` 返回历史列表，时间倒序
+
+---
+
 ## Phase 6 — 前端
 
 ### 目标
@@ -915,15 +1167,26 @@ room.on(RoomEvent.DataReceived, (payload, participant) => {
 ### 7.1 PostgreSQL（asyncpg）
 
 ```sql
--- 会话表
+-- 客户表（Phase 3.5 新增：顾问专属链接的身份锚点）
+CREATE TABLE clients (
+    client_id     UUID PRIMARY KEY,
+    client_token  TEXT UNIQUE NOT NULL,  -- URL 中的 token，顾问后台生成
+    advisor_id    TEXT,
+    name          TEXT,
+    phone         TEXT,
+    created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+-- 会话表（新增 client_id 外键）
 CREATE TABLE sessions (
     session_id    UUID PRIMARY KEY,
+    client_id     UUID REFERENCES clients,  -- ★新增：关联客户
     created_at    TIMESTAMPTZ DEFAULT now(),
     updated_at    TIMESTAMPTZ DEFAULT now(),
     status        TEXT NOT NULL,
-    state_json    JSONB NOT NULL,    -- InterviewState 序列化
-    report_pdf    BYTEA,            -- 生成后存储
-    consent_at    TIMESTAMPTZ       -- 知情同意时间戳
+    state_json    JSONB NOT NULL,            -- InterviewState 序列化
+    consent_at    TIMESTAMPTZ               -- 知情同意时间戳
+    -- report_pdf 移至 diagnosis_reports 表，此处不再存储
 );
 
 -- 提取结果表（按单元拆分，方便分析）
@@ -935,6 +1198,41 @@ CREATE TABLE extractions (
     field_value   JSONB,
     extracted_at  TIMESTAMPTZ DEFAULT now()
 );
+
+-- 诊断报告表（Phase 5.5 新增：独立存储结构化评分，支持历史查询和 Delta 对比）
+CREATE TABLE diagnosis_reports (
+    report_id           UUID PRIMARY KEY,
+    client_id           UUID NOT NULL REFERENCES clients,
+    session_id          UUID REFERENCES sessions,
+    created_at          TIMESTAMPTZ DEFAULT now(),
+    unit_scores         JSONB NOT NULL,          -- {unit_id: score}
+    dimension_scores    JSONB NOT NULL,          -- {维度名: score}
+    overall_risk_level  TEXT NOT NULL,           -- "低/中/中高/高风险"
+    top_risks           JSONB,
+    recommendations     JSONB,
+    emotion_summary     JSONB,
+    report_pdf          BYTEA,                   -- 最终生成的 PDF
+    report_html         TEXT
+);
+
+-- 诊断对比表（Phase 5.5 新增）
+CREATE TABLE diagnosis_comparisons (
+    comparison_id       UUID PRIMARY KEY,
+    client_id           UUID NOT NULL REFERENCES clients,
+    baseline_report_id  UUID NOT NULL REFERENCES diagnosis_reports,
+    current_report_id   UUID NOT NULL REFERENCES diagnosis_reports,
+    created_at          TIMESTAMPTZ DEFAULT now(),
+    overall_risk_change TEXT,
+    dimension_deltas    JSONB,
+    unit_improvements   JSONB,
+    unit_regressions    JSONB,
+    trend_summary       TEXT,
+    insights            JSONB
+);
+
+-- 查询索引
+CREATE INDEX idx_sessions_client ON sessions(client_id, created_at DESC);
+CREATE INDEX idx_reports_client_date ON diagnosis_reports(client_id, created_at DESC);
 ```
 
 ### 7.2 Redis
@@ -943,24 +1241,32 @@ CREATE TABLE extractions (
 # app/storage/redis_cache.py
 class RedisCache:
     async def save_state(self, session_id: str, state: InterviewState):
-        """断线保护：每轮对话后保存"""
+        """断线保护：每轮对话后保存，TTL 按访谈阶段动态调整"""
+        ttl_map = {
+            "greeting":    6 * 3600,   # 6h
+            "interviewing": 24 * 3600, # 24h（可能隔天继续）
+            "diagnosing":  24 * 3600,
+            "done":        72 * 3600,  # 72h（报告可查）
+        }
+        ttl = ttl_map.get(state.status.value, 3600)
         await redis.set(
             f"session:{session_id}:state",
             state.model_dump_json(),
-            ex=3600  # 1小时过期
+            ex=ttl
         )
 
     async def load_state(self, session_id: str) -> InterviewState | None:
         raw = await redis.get(f"session:{session_id}:state")
         if raw:
             return InterviewState.model_validate_json(raw)
-        return None
+        return None  # 降级：调用方从 PostgreSQL 恢复
 ```
 
 ### 验收标准
-- [ ] 访谈中途断开，重新连接后从断点继续
-- [ ] 报告 PDF 存入 PostgreSQL，可通过 API 下载
-- [ ] Redis 中会话状态 TTL 正常（1小时）
+- [ ] 访谈中途断开，重新点击专属链接后从断点继续（Phase 3.5 联动）
+- [ ] 报告 PDF 存入 `diagnosis_reports` 表，可通过 `GET /report/{id}/pdf` 下载
+- [ ] Redis TTL 随访谈阶段变化（greeting=6h，interviewing=24h）
+- [ ] Redis 过期时，从 PostgreSQL `state_json` 正常降级恢复
 
 ---
 
@@ -1112,17 +1418,26 @@ Week 5（Phase 10）：生产部署，上线
 
 ---
 
-## 待定事项（需业务侧确认）
+## 业务决策（已确认）
 
-| 编号 | 问题 | 影响 |
+| 编号 | 问题 | 决策 |
 |------|------|------|
-| T-1 | 核心层 30 个单元的具体选择 | 影响 Phase 2 题库建设 |
-| T-2 | 260 个单元的完整字段定义表 | 影响 Phase 4 提取配置 |
-| T-3 | 各单元评分规则（权重、阈值） | 影响 Phase 5 诊断引擎 |
-| T-4 | 报告模板设计稿 | 影响 Phase 5 报告生成 |
-| T-5 | 时间超限收尾策略（45分钟到了） | 影响 Phase 3 状态机 |
-| T-6 | 是否需要顾问人工复核环节 | 影响整体流程设计 |
+| D-1 | 用户身份识别方式 | **顾问发送专属链接**（`/c/{client_token}`），客户无需注册 |
+| D-2 | 变化诊断触发方式 | **自动，报告内嵌**：诊断完成后自动与上次对比，PDF 含对比章节 |
 
 ---
 
-*开发计划 v2.0 | 基于架构设计文档 v1.0 | 2026-03-02*
+## 待定事项（需业务侧确认）
+
+| 编号 | 问题 | 影响阶段 |
+|------|------|---------|
+| T-1 | 核心层 30 个单元的具体选择 | Phase 2 |
+| T-2 | 260 个单元的完整字段定义表 | Phase 4 |
+| T-3 | 各单元评分规则（权重、阈值） | Phase 5 |
+| T-4 | 报告模板设计稿 | Phase 5 |
+| T-5 | 时间超限收尾策略（45分钟到了） | Phase 3 |
+| T-6 | 是否需要顾问人工复核环节 | 整体流程 |
+
+---
+
+*开发计划 v2.1 | 基于架构设计文档 v1.0 | 2026-03-02*
